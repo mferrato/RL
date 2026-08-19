@@ -729,6 +729,65 @@ class TestDTensorParamsGenerator:
                 f"Tensor {name} should be converted to {target_dtype}"
             )
 
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="CUDA is not available"
+                ),
+            ),
+        ],
+    )
+    def test_refit_preserves_native_buffer_dtypes(self, device):
+        """Refit metadata and payload preserve adapted buffer dtypes exactly."""
+        model = nn.Module()
+        model.register_parameter(
+            "weight",
+            nn.Parameter(
+                torch.tensor([1.0, -2.0], dtype=torch.bfloat16, device=device)
+            ),
+        )
+        model.register_buffer(
+            "router_bias",
+            torch.tensor(
+                [1.0001, -0.33337, 12345.125], dtype=torch.float32, device=device
+            ),
+        )
+        model.register_buffer(
+            "position_ids", torch.tensor([0, 3, 7], dtype=torch.int64, device=device)
+        )
+
+        adapter = Mock()
+        adapter.convert_single_tensor_to_hf.side_effect = (
+            lambda fqn, tensor, **_kwargs: [(f"hf.{fqn}", tensor)]
+        )
+        model.state_dict_adapter = adapter
+
+        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker.model = model
+        worker.dtype = torch.bfloat16
+
+        metadata = worker.prepare_refit_info()
+        payloads = dict(dtensor_params_generator(model, torch.bfloat16))
+
+        assert metadata is not None
+        assert payloads["hf.weight"].dtype == torch.bfloat16
+        assert metadata["hf.router_bias"][1] == torch.float32
+        assert payloads["hf.router_bias"].dtype == torch.float32
+        assert payloads["hf.router_bias"].is_contiguous()
+        assert torch.equal(
+            payloads["hf.router_bias"].view(torch.int32),
+            model.router_bias.view(torch.int32),
+        )
+        assert metadata["hf.position_ids"][1] == torch.int64
+        assert payloads["hf.position_ids"].dtype == torch.int64
+        assert metadata.keys() == payloads.keys()
+        for name, payload in payloads.items():
+            assert metadata[name] == (payload.shape, payload.dtype)
+
     def test_contiguous_output(self):
         """Test that output tensors are contiguous."""
         # Arrange

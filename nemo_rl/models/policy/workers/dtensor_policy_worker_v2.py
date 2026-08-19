@@ -87,32 +87,49 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
 
 
+def _get_refit_dtype(
+    fqn: str,
+    tensor: torch.Tensor,
+    *,
+    buffer_names: set[str],
+    target_dtype: torch.dtype,
+) -> torch.dtype:
+    """Select the refit dtype for a state-dict entry."""
+    return tensor.dtype if fqn in buffer_names else target_dtype
+
+
 def dtensor_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
+    """Yield adapted local tensors using parameter and buffer refit dtypes.
 
     Args:
         model: The model whose parameters to generate.
-        target_dtype: The dtype to convert tensors to.
-        peft_config: Optional LoRA config for filtering which layers to merge.
+        target_dtype: The dtype to convert parameters to. Buffers retain their
+            native dtype.
 
     Yields:
-        Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
+        Tuples of (fully_qualified_name, tensor) with contiguous payloads.
     """
     module_map = dict(model.named_modules())
+    buffer_names = {name for name, _ in model.named_buffers(remove_duplicate=False)}
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
         merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
+        refit_dtype = _get_refit_dtype(
+            name,
+            merged_tensor,
+            buffer_names=buffer_names,
+            target_dtype=target_dtype,
+        )
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Convert to target dtype
             yield (
                 adapted_fqn,
-                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+                adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
             )
             del adapted_tensor
         del adapted_fqn_tensors
@@ -1074,18 +1091,26 @@ class DTensorPolicyWorkerV2Impl(
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
+        buffer_names = {
+            name for name, _ in self.model.named_buffers(remove_duplicate=False)
+        }
         for name, tensor in self.model.state_dict().items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
                 continue
             full_tensor = (
                 tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
             )
-            # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
+            refit_dtype = _get_refit_dtype(
+                name,
+                full_tensor,
+                buffer_names=buffer_names,
+                target_dtype=self.dtype,
+            )
             adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
                 self.model, name, full_tensor
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
+                state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
 
         return state_dict_info
 
